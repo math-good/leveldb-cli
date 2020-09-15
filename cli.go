@@ -8,12 +8,19 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/util"
 	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
+	"syscall"
+	"time"
 )
 
 var (
-	h    bool
-	path string
+	h           bool
+	path        string
+	r           bool
+	clearOnExit bool
 )
 
 func keys(db *leveldb.DB, cmd_args []string) {
@@ -65,6 +72,11 @@ func set(db *leveldb.DB, cmd_args []string) {
 		return
 	}
 
+	if r {
+		fmt.Println("readonly mode")
+		return
+	}
+
 	key := cmd_args[0]
 	value := cmd_args[1]
 
@@ -79,6 +91,11 @@ func set(db *leveldb.DB, cmd_args []string) {
 func delete(db *leveldb.DB, cmd_args []string) {
 	if len(cmd_args) == 0 {
 		fmt.Println("key required")
+		return
+	}
+
+	if r {
+		fmt.Println("readonly mode")
 		return
 	}
 
@@ -110,7 +127,33 @@ func exist(db *leveldb.DB, cmd_args []string) {
 
 func init() {
 	flag.BoolVar(&h, "h", false, "leveldb-cli usage")
+	flag.BoolVar(&r, "r", false, "open leveldb in readonly mode")
 	flag.StringVar(&path, "p", "", "leveldb database absolute path")
+}
+
+/**
+leveldb不能以多进程方式访问
+拷贝数据库，以只读方式打开
+*/
+func openReadonly() *leveldb.DB {
+	newDbPath := filepath.Join(os.TempDir(), fmt.Sprintf("leveldb-%v", time.Now().UnixNano()))
+	//拷贝数据库到临时目录
+	fmt.Println("copy ", path, " to ", newDbPath)
+	CopyDir(path, newDbPath)
+
+	db, err := leveldb.OpenFile(newDbPath, nil)
+
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(0)
+	}
+
+	r = true
+	//退出时清除
+	clearOnExit = true
+	path = newDbPath
+
+	return db
 }
 
 /**
@@ -131,10 +174,32 @@ func main() {
 
 	db, err := leveldb.OpenFile(path, nil)
 	if err != nil {
-		fmt.Println(err.Error())
-		return
+		sysErr, isSysErr := err.(syscall.Errno)
+		if isSysErr {
+			fmt.Println(sysErr.Error())
+			if runtime.GOOS == "linux" {
+				//linux
+				if match, _ := regexp.MatchString(".*resource temporarily unavailable.*", sysErr.Error()); match {
+					db = openReadonly()
+				}
+			} else if runtime.GOOS == "windows" {
+				//internal/syscall/windows.ERROR_SHARING_VIOLATION (32)
+				//windows
+				if match, _ := regexp.MatchString(".*it is being used by another process.*", sysErr.Error()); match {
+					db = openReadonly()
+				}
+			}
+		} else {
+			fmt.Println(err.Error())
+			return
+		}
 	}
-	defer db.Close()
+	defer func() {
+		db.Close()
+		if clearOnExit {
+			os.RemoveAll(path)
+		}
+	}()
 
 	fmt.Println("Welcome to the leveldb cli!")
 	fmt.Println("Enter '?' for a list of commands.")
@@ -177,7 +242,7 @@ func main() {
 			fmt.Println("\texist key        \texist key")
 			break
 		case "EXIT":
-			os.Exit(0)
+			return
 		case "PATH":
 			fmt.Println("leveldb path: ", path)
 			break
